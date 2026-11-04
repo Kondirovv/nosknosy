@@ -1,0 +1,3 @@
+# Одна RSS-лента на строку. Замените на свои источники.
+https://habr.com/ru/rss/news/?fl=ru
+https://www.theverge.com/rss/index.xml

@@ -1,0 +1,39 @@
+name: Post to Telegram
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # каждые 3 часа (UTC)
+  workflow_dispatch: {}      # ручной запуск из вкладки Actions
+
+permissions:
+  contents: write
+
+# Не даём двум запускам идти одновременно (иначе возможны дубли постов)
+concurrency:
+  group: post-to-telegram
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python bot.py
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "news-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add posted.json
+          git diff --staged --quiet || (git commit -m "update posted" && git pull --rebase && git push)

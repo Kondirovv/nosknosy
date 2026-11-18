@@ -1,0 +1,2 @@
+window.SHOP_API={url:'https://qmbtdcamxsoihloapajr.supabase.co/functions/v1/shop-orders',key:'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFtYnRkY2FteHNvaWhsb2FwYWpyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ5NzQ3MDIsImV4cCI6MjExMDU1MDcwMn0.93rnqj7KjWrh4TgJkHFEx2xHMOOjtWMRo1JRaJfHg5c'};
+

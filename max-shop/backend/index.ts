@@ -4,7 +4,8 @@ import {rootCA} from './max-ca.ts';
 
 const site='https://nos-k-nosu-shop.onrender.com';
 const chat='-81360141302484';
-const token=Deno.env.get('MAX_BOT_TOKEN');
+const storedToken=(Deno.env.get('MAX_BOT_TOKEN')||'').trim();
+const token=storedToken && storedToken!=='MAX_BOT_TOKEN' && !/^\*+$/.test(storedToken) && !/\s/.test(storedToken) ? storedToken : '';
 const dbUrl=Deno.env.get('SUPABASE_URL');
 const dbKey=Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
 const client=Deno.createHttpClient({caCerts:[rootCA]});

@@ -137,7 +137,7 @@ def _parse_xml(raw: bytes) -> dict:
         raise ValueError('В XML не найдены сведения УПД')
     if doc.attrib.get('Функция') not in ('СЧФДОП', 'ДОП'):
         raise ValueError('Поддерживаются УПД с функцией СЧФДОП или ДОП')
-    seller = ''
+    seller = seller_inn = ''
     seller_el = _first(invoice, 'СвПрод')
     if seller_el is not None:
         legal = _first(seller_el, 'СвЮЛУч')
@@ -145,6 +145,7 @@ def _parse_xml(raw: bytes) -> dict:
             legal = _first(seller_el, 'СвИП')
         if legal is not None:
             seller = legal.attrib.get('НаимОрг', '')
+            seller_inn = legal.attrib.get('ИННЮЛ', '')
     rows = []
     for line in table.iter():
         if _local(line.tag) != 'СведТов':
@@ -190,7 +191,7 @@ def _parse_xml(raw: bytes) -> dict:
     return {
         'number': invoice.attrib.get('НомерДок', ''),
         'date': invoice.attrib.get('ДатаДок', ''),
-        'seller': seller,
+        'seller': seller, 'seller_inn': seller_inn,
         'rows': rows,
         'line_total': money(calculated),
         'declared_total': money(declared) if declared is not None else '—',
@@ -376,7 +377,22 @@ def _gtin_key(value):
     return value.zfill(14) if checksum % 10 == 0 else ''
 
 
-def _match_catalog(rows, products):
+# Confirmed against posted Yarvet receipt No. 2 (UT-422670).
+_SUPPLIER_BARCODES = {
+    '7604287662': {
+        'ут-063657': ('4670052820121', 'шт'),
+        'ут-030413': ('4619887000346', 'шт'),
+        'ут-071242': ('6953182760597', 'шт'),
+        'ут-063241': ('6953182713258', 'шт'),
+        'ут-064045': ('6953182735557', 'упак'),
+        'ут-043099': ('4610004683350', 'шт'),
+        'ут-00024862': ('4650104751689', 'шт'),
+        'ут-00019758': ('4605851000054', 'шт'),
+    },
+}
+
+
+def _match_catalog(rows, products, seller_inn=''):
     indexes = {field: defaultdict(dict) for field in ('barcode', 'code', 'name')}
     for product in products:
         for field, values in (
@@ -391,6 +407,11 @@ def _match_catalog(rows, products):
         gtin = _gtin_key(row['gtin'])
         candidates = indexes['barcode'].get(gtin) or {}
         method = 'GTIN'
+        if not row['gtin'].strip():
+            binding = _SUPPLIER_BARCODES.get(seller_inn, {}).get(_catalog_key(row['supplier_code']))
+            if binding and _catalog_key(row['unit']) == binding[1]:
+                candidates = indexes['barcode'].get(_gtin_key(binding[0])) or {}
+                method = 'привязка поставщика'
         if not candidates:
             candidates = indexes['code'].get(_catalog_key(row['supplier_code'])) or {}
             method = 'артикул или код'
@@ -402,13 +423,16 @@ def _match_catalog(rows, products):
         elif candidates:
             product = next(iter(candidates.values()))
             row['catalog_name'] = product['name']
-            row['catalog_status'] = 'Совпадение по GTIN' if method == 'GTIN' else f'Проверьте карточку вручную: {method}'
-            if method == 'GTIN' and _catalog_key(row['unit']) == _catalog_key(product['measure']):
+            verified = method in ('GTIN', 'привязка поставщика')
+            row['catalog_status'] = ('Подтверждённая привязка ЯРВЕТ' if method == 'привязка поставщика'
+                                     else 'Совпадение по GTIN' if verified
+                                     else f'Проверьте карточку вручную: {method}')
+            if verified and _catalog_key(row['unit']) == _catalog_key(product['measure']):
                 row['catalog_price'] = product['sale']
                 row['compare_price'] = True
                 if product['sale'] is not None and product['sale'] <= 0:
                     row['catalog_status'] += ' · Цена продажи ≤ 0 ₽'
-            elif method == 'GTIN':
+            elif verified:
                 row['catalog_status'] += ' · Единицы измерения различаются'
         else:
             row['catalog_status'] = 'Карточка не найдена' if gtin else 'Карточка не найдена · Нет корректного GTIN'
@@ -450,10 +474,11 @@ def invoice_page():
                 error = str(exc)
     if parsed:
         try:
-            _match_catalog(parsed['rows'], _live_catalog())
+            _match_catalog(parsed['rows'], _live_catalog(), parsed['seller_inn'])
         except (OSError, ValueError, TypeError, KeyError):
             catalog_error = 'Каталог Эвотора сейчас недоступен. Расчёт УПД готов, сверка карточек не выполнена.'
     return v06._show('УПД и расчёт цен', 'Загрузи XML для предварительной сверки и назначения наценок.', _INVOICE,
                      csrf=v06._csrf(), parsed=parsed, error=error, catalog_error=catalog_error, rules=CATEGORY_RULES,
                      rates={k: int(rate) for k, rate in RATES.items()})
+
 

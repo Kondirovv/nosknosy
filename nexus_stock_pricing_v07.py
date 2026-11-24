@@ -362,7 +362,10 @@ def _invoice_csp(response):
     if request.path == '/invoice' and response.mimetype == 'text/html':
         policy = response.headers.get('Content-Security-Policy', '')
         if "script-src" not in policy:
-            response.headers['Content-Security-Policy'] = policy + "; script-src 'self'"
+            policy += "; script-src 'self'"
+        if "connect-src" not in policy:
+            policy += "; connect-src 'self'"
+        response.headers['Content-Security-Policy'] = policy
     return response
 
 app.after_request_funcs.setdefault(None, []).insert(0, _invoice_csp)

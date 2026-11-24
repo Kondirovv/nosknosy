@@ -11,6 +11,10 @@ Uploaded XML is not stored, emailed, sent to third parties, or forwarded to Evot
 from __future__ import annotations
 
 import io
+import json
+import os
+import urllib.request
+from collections import defaultdict
 import re
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 from xml.etree import ElementTree as ET
@@ -253,10 +257,14 @@ _INVOICE = '''
 <div class="panel"><h2>УПД № {{parsed.number}} от {{parsed.date}}</h2>
 <p>Поставщик: {{parsed.seller or 'Не указан'}} · Позиции: {{parsed.rows|length}} · сумма по строкам: {{parsed.line_total}} ₽ · итог УПД: {{parsed.declared_total}} ₽</p>
 {% if parsed.warning %}<div class="warning">{{parsed.warning}}</div>{% endif %}
-<div class="scroll"><table id="invoice-table" style="min-width:1150px"><thead><tr><th>№</th><th>Товар и артикул</th><th>GTIN и маркировка</th><th class="num">Кол-во</th><th class="num">Закупка за шт., ₽</th><th>Категория</th><th>Вес мешка, кг</th><th class="num">Розница, ₽</th><th class="num">Стоимость по рознице, ₽</th></tr></thead><tbody>
+{% if catalog_error %}<div class="notice">{{ catalog_error }}</div>{% endif %}
+<div class="scroll"><table id="invoice-table" style="min-width:1150px"><thead><tr><th>№</th><th>Товар и артикул</th><th>GTIN и маркировка</th><th>Каталог Эвотора</th><th class="num">Кол-во</th><th class="num">Закупка за шт., ₽</th><th>Категория</th><th>Вес мешка, кг</th><th class="num">Розница, ₽</th><th class="num">Стоимость по рознице, ₽</th></tr></thead><tbody>
 {% for r in parsed.rows %}<tr data-name="{{r.name}}" data-qty="{{r.qty}}" data-cost="{{r.cost}}" data-gtin="{{r.gtin}}" data-code="{{r.supplier_code}}">
 <td>{{r.index}}</td><td><strong>{{r.name}}</strong><br><span class="muted">Артикул {{r.supplier_code or '—'}}</span></td>
 <td>{{r.gtin or 'Не указан'}}<br><span class="muted">Маркируемых единиц в УПД: {{r.declared_marks or 'нет данных'}}</span></td>
+<td>{{ r.catalog_status or 'Сверка недоступна' }}{% if r.catalog_name %}<br>{{ r.catalog_name }}{% endif %}
+{% if r.compare_price %}<br>{% if r.catalog_price is not none %}Цена: {{ r.catalog_price }} ₽
+<span class="catalog-delta" data-price="{{ r.catalog_price }}"></span>{% else %}Цена отсутствует{% endif %}{% endif %}</td>
 <td class="num">{{r.qty_label}} {{r.unit}}</td><td class="num">{{r.cost_label}}</td>
 <td><select class="row-category"><option value="">Выбрать категорию</option>{% for key,label,percent in rules %}<option value="{{key}}" {% if key==r.category %}selected{% endif %}>{{label}} (+{{percent}}%)</option>{% endfor %}</select></td>
 <td><input class="row-weight" type="number" step="0.01" min="0.01" placeholder="Если развес"></td><td class="num"><strong class="row-price">{{r.retail or '—'}}</strong></td><td class="num"><strong class="row-total">—</strong></td>
@@ -280,12 +288,18 @@ function calc(){let sum=0,ready=0;
   const cost=Number(tr.dataset.cost),qty=Number(tr.dataset.qty);
   const key=tr.querySelector('.row-category').value;
   const weight=Number(tr.querySelector('.row-weight').value);
+  const delta=tr.querySelector('.catalog-delta');
+  if(delta) delta.textContent='';
   const priceCell=tr.querySelector('.row-price');const totalCell=tr.querySelector('.row-total');
   const base=key==='loose_feed'? (weight>0?cost/weight:NaN):cost;
   if(!key||!Number.isFinite(base)||base<=0){priceCell.textContent='—';totalCell.textContent='—';continue;}
   const price=Math.ceil((base*(1+rates[key]/100)-1e-8)/10)*10;
   if(!Number.isFinite(price)||price<=0){priceCell.textContent='—';totalCell.textContent='—';continue;}
   priceCell.textContent=String(price);
+  if(delta && key!=='loose_feed'){
+    const difference=price-Number(delta.dataset.price);
+    delta.textContent=Math.abs(difference)<0.005?' · Совпадает':' · План − каталог: '+difference.toFixed(2)+' ₽';
+  }
   const total=key==='loose_feed'?price*qty*weight:price*qty;
   totalCell.textContent=Number.isFinite(total)?total.toFixed(2):'—';
   if(Number.isFinite(total)){sum+=total;ready++;}
@@ -349,11 +363,76 @@ def pricing_page():
                      rate=int(RATES[cat]), result=result, error=error)
 
 
+def _catalog_key(value):
+    return ' '.join(str(value or '').casefold().split())
+
+
+def _gtin_key(value):
+    value = str(value or '').strip()
+    if len(value) not in (8, 12, 13, 14) or not value.isascii() or not value.isdigit():
+        return ''
+    checksum = sum(int(digit) * (3 if i % 2 else 1)
+                   for i, digit in enumerate(reversed(value)))
+    return value.zfill(14) if checksum % 10 == 0 else ''
+
+
+def _match_catalog(rows, products):
+    indexes = {field: defaultdict(dict) for field in ('barcode', 'code', 'name')}
+    for product in products:
+        for field, values in (
+            ('barcode', map(_gtin_key, product['barcodes'])),
+            ('code', map(_catalog_key, (product['code'], product['article']))),
+            ('name', [_catalog_key(product['name'])]),
+        ):
+            for value in filter(None, values):
+                indexes[field][value][product['id']] = product
+
+    for row in rows:
+        gtin = _gtin_key(row['gtin'])
+        candidates = indexes['barcode'].get(gtin) or {}
+        method = 'GTIN'
+        if not candidates:
+            candidates = indexes['code'].get(_catalog_key(row['supplier_code'])) or {}
+            method = 'артикул или код'
+        if not candidates:
+            candidates = indexes['name'].get(_catalog_key(row['name'])) or {}
+            method = 'название'
+        if len(candidates) > 1:
+            row['catalog_status'] = f'Несколько карточек ({len(candidates)}), поиск по полю «{method}»'
+        elif candidates:
+            product = next(iter(candidates.values()))
+            row['catalog_name'] = product['name']
+            row['catalog_status'] = 'Совпадение по GTIN' if method == 'GTIN' else f'Проверьте карточку вручную: {method}'
+            if method == 'GTIN' and _catalog_key(row['unit']) == _catalog_key(product['measure']):
+                row['catalog_price'] = product['sale']
+                row['compare_price'] = True
+                if product['sale'] is not None and product['sale'] <= 0:
+                    row['catalog_status'] += ' · Цена продажи ≤ 0 ₽'
+            elif method == 'GTIN':
+                row['catalog_status'] += ' · Единицы измерения различаются'
+        else:
+            row['catalog_status'] = 'Карточка не найдена' if gtin else 'Карточка не найдена · Нет корректного GTIN'
+
+
+def _live_catalog():
+    key = os.getenv('NEXUS_STOCK_ADMIN_KEY')
+    if not key:
+        raise ValueError('Missing catalogue key')
+    req = urllib.request.Request(
+        'https://qmbtdcamxsoihloapajr.supabase.co/functions/v1/nexus-stock-invoice-catalog',
+        headers={'X-Nexus-Key': key, 'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=20) as response:
+        data = json.load(response)
+    if data.get('version') != 1 or not isinstance(data.get('items'), list):
+        raise ValueError('Unexpected catalogue response')
+    return data['items']
+
+
 @app.route('/invoice', methods=['GET', 'POST'])
 def invoice_page():
     if not v06._authenticated():
         return redirect(url_for('dashboard_login'))
-    parsed = error = None
+    parsed = error = catalog_error = None
     if request.method == 'POST':
         if request.content_length is not None and request.content_length > MAX_XML_BYTES + 512_000:
             abort(413)
@@ -369,6 +448,12 @@ def invoice_page():
                 parsed = _parse_xml(raw)
             except ValueError as exc:
                 error = str(exc)
+    if parsed:
+        try:
+            _match_catalog(parsed['rows'], _live_catalog())
+        except (OSError, ValueError, TypeError, KeyError):
+            catalog_error = 'Каталог Эвотора сейчас недоступен. Расчёт УПД готов, сверка карточек не выполнена.'
     return v06._show('УПД и расчёт цен', 'Загрузи XML для предварительной сверки и назначения наценок.', _INVOICE,
-                     csrf=v06._csrf(), parsed=parsed, error=error, rules=CATEGORY_RULES,
+                     csrf=v06._csrf(), parsed=parsed, error=error, catalog_error=catalog_error, rules=CATEGORY_RULES,
                      rates={k: int(rate) for k, rate in RATES.items()})
+

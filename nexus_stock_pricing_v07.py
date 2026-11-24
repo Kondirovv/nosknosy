@@ -14,12 +14,13 @@ import io
 import json
 import os
 import urllib.request
+import urllib.parse
 from collections import defaultdict
 import re
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 from xml.etree import ElementTree as ET
 
-from flask import Response, abort, redirect, request, url_for
+from flask import Response, jsonify, abort, redirect, request, url_for
 import nexus_stock_review_v06 as v06
 
 app = v06.app
@@ -145,7 +146,7 @@ def _parse_xml(raw: bytes) -> dict:
             legal = _first(seller_el, 'СвИП')
         if legal is not None:
             seller = legal.attrib.get('НаимОрг', '')
-            seller_inn = legal.attrib.get('ИННЮЛ', '')
+            seller_inn = legal.attrib.get('ИННЮЛ') or legal.attrib.get('ИННФЛ', '')
     rows = []
     for line in table.iter():
         if _local(line.tag) != 'СведТов':
@@ -259,11 +260,18 @@ _INVOICE = '''
 <p>Поставщик: {{parsed.seller or 'Не указан'}} · Позиции: {{parsed.rows|length}} · сумма по строкам: {{parsed.line_total}} ₽ · итог УПД: {{parsed.declared_total}} ₽</p>
 {% if parsed.warning %}<div class="warning">{{parsed.warning}}</div>{% endif %}
 {% if catalog_error %}<div class="notice">{{ catalog_error }}</div>{% endif %}
+{% if products and parsed.rows|selectattr('can_bind', 'defined')|selectattr('can_bind')|list %}
+<datalist id="catalog-options">{% for p in products %}<option value="{{p.name}} · {{p.measure}} · {{p.article or p.code}} · {{p.id}}" data-id="{{p.id}}"></option>{% endfor %}</datalist>
+{% endif %}
+<div id="binding-context" data-inn="{{parsed.seller_inn}}" data-csrf="{{csrf}}" data-url="{{url_for('invoice_bind')}}"></div>
 <div class="scroll"><table id="invoice-table" style="min-width:1150px"><thead><tr><th>№</th><th>Товар и артикул</th><th>GTIN и маркировка</th><th>Каталог Эвотора</th><th class="num">Кол-во</th><th class="num">Закупка за шт., ₽</th><th>Категория</th><th>Вес мешка, кг</th><th class="num">Розница, ₽</th><th class="num">Стоимость по рознице, ₽</th></tr></thead><tbody>
 {% for r in parsed.rows %}<tr data-name="{{r.name}}" data-qty="{{r.qty}}" data-cost="{{r.cost}}" data-gtin="{{r.gtin}}" data-code="{{r.supplier_code}}">
 <td>{{r.index}}</td><td><strong>{{r.name}}</strong><br><span class="muted">Артикул {{r.supplier_code or '—'}}</span></td>
 <td>{{r.gtin or 'Не указан'}}<br><span class="muted">Маркируемых единиц в УПД: {{r.declared_marks or 'нет данных'}}</span></td>
 <td>{{ r.catalog_status or 'Сверка недоступна' }}{% if r.catalog_name %}<br>{{ r.catalog_name }}{% endif %}
+{% if r.can_bind and products %}<div><input class="binding-choice" list="catalog-options" aria-label="Выбрать карточку Эвотора" placeholder="Поиск карточки">
+<button type="button" class="bind-product" data-unit="{{r.unit}}">Сохранить привязку</button>
+<span class="binding-status" aria-live="polite"></span></div>{% endif %}
 {% if r.compare_price %}<br>{% if r.catalog_price is not none %}Цена: {{ r.catalog_price }} ₽
 <span class="catalog-delta" data-price="{{ r.catalog_price }}"></span>{% else %}Цена отсутствует{% endif %}{% endif %}</td>
 <td class="num">{{r.qty_label}} {{r.unit}}</td><td class="num">{{r.cost_label}}</td>
@@ -283,6 +291,25 @@ _INVOICE_SCRIPT = r'''
 (function(){
 const rates={"feed":80,"loose_feed":90,"natural_treats":200,"factory_treats":100,"toys":180,"fillers":250,"litter_boxes":250,"leashes":200,"bowls":200,"care":200,"supplements":35,"other":300};
 const trs=Array.from(document.querySelectorAll('#invoice-table tbody tr'));
+const bindContext=document.getElementById('binding-context');
+for(const button of document.querySelectorAll('.bind-product')){
+ button.addEventListener('click',async()=>{
+  const box=button.parentElement, choice=box.querySelector('.binding-choice');
+  const status=box.querySelector('.binding-status');
+  const selected=Array.from(document.getElementById('catalog-options').options).find(o=>o.value===choice.value);
+  if(!selected){status.textContent='Выберите карточку из списка.';return;}
+  button.disabled=true;
+  try{
+   const response=await fetch(bindContext.dataset.url,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({inn:bindContext.dataset.inn,csrf:bindContext.dataset.csrf,
+     article:button.closest('tr').dataset.code,unit:button.dataset.unit,product_id:selected.dataset.id})});
+   const result=await response.json();
+   if(!response.ok||!result.ok) throw Error(result.error||'Не удалось сохранить привязку.');
+   status.textContent='Сохранено: '+result.name+'. Повторная загрузка УПД применит привязку.';
+  }catch(error){status.textContent=error.message||'Не удалось сохранить привязку.';}
+  finally{button.disabled=false;}
+ });
+}
 const escCSV=(v)=>{const t=String(v??'').replace(/[\r\n]+/g,' ');const safe=/^\s*[=+\-@]/.test(t)?'\''+t:t;return '"'+safe.replaceAll('"','""')+'"';};
 function calc(){let sum=0,ready=0;
  for(const tr of trs){
@@ -392,7 +419,9 @@ _SUPPLIER_BARCODES = {
 }
 
 
-def _match_catalog(rows, products, seller_inn=''):
+def _match_catalog(rows, products, seller_inn='', bindings=()):
+    by_id = {p['id']: p for p in products}
+    saved = {(b['article'], b['unit']): b['product_id'] for b in bindings}
     indexes = {field: defaultdict(dict) for field in ('barcode', 'code', 'name')}
     for product in products:
         for field, values in (
@@ -408,8 +437,15 @@ def _match_catalog(rows, products, seller_inn=''):
         candidates = indexes['barcode'].get(gtin) or {}
         method = 'GTIN'
         if not row['gtin'].strip():
+            identity = (_catalog_key(row['supplier_code']), _catalog_key(row['unit']))
+            product = by_id.get(saved.get(identity))
+            if product and _catalog_key(product['measure']) == identity[1]:
+                candidates = {product['id']: product}
+                method = 'сохранённая карточка'
+            row['can_bind'] = bool(re.fullmatch(r'[0-9]{10}(?:[0-9]{2})?', seller_inn)
+                                   and identity[0] and len(identity[0]) <= 150 and identity[1])
             binding = _SUPPLIER_BARCODES.get(seller_inn, {}).get(_catalog_key(row['supplier_code']))
-            if binding and _catalog_key(row['unit']) == binding[1]:
+            if not candidates and binding and _catalog_key(row['unit']) == binding[1]:
                 candidates = indexes['barcode'].get(_gtin_key(binding[0])) or {}
                 method = 'привязка поставщика'
         if not candidates:
@@ -423,8 +459,9 @@ def _match_catalog(rows, products, seller_inn=''):
         elif candidates:
             product = next(iter(candidates.values()))
             row['catalog_name'] = product['name']
-            verified = method in ('GTIN', 'привязка поставщика')
-            row['catalog_status'] = ('Подтверждённая привязка ЯРВЕТ' if method == 'привязка поставщика'
+            verified = method in ('GTIN', 'привязка поставщика', 'сохранённая карточка')
+            row['catalog_status'] = ('Подтверждённая карточка' if method == 'сохранённая карточка'
+                                     else 'Подтверждённая привязка ЯРВЕТ' if method == 'привязка поставщика'
                                      else 'Совпадение по GTIN' if verified
                                      else f'Проверьте карточку вручную: {method}')
             if verified and _catalog_key(row['unit']) == _catalog_key(product['measure']):
@@ -438,18 +475,44 @@ def _match_catalog(rows, products, seller_inn=''):
             row['catalog_status'] = 'Карточка не найдена' if gtin else 'Карточка не найдена · Нет корректного GTIN'
 
 
-def _live_catalog():
+def _catalog_request(seller_inn='', payload=None):
     key = os.getenv('NEXUS_STOCK_ADMIN_KEY')
     if not key:
         raise ValueError('Missing catalogue key')
     req = urllib.request.Request(
-        'https://qmbtdcamxsoihloapajr.supabase.co/functions/v1/nexus-stock-invoice-catalog',
-        headers={'X-Nexus-Key': key, 'Accept': 'application/json'})
+        'https://qmbtdcamxsoihloapajr.supabase.co/functions/v1/nexus-stock-invoice-catalog?'
+        + urllib.parse.urlencode({'supplier': seller_inn}),
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={'X-Nexus-Key': key, 'Accept': 'application/json', 'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=20) as response:
         data = json.load(response)
+    if payload is not None:
+        return data
     if data.get('version') != 1 or not isinstance(data.get('items'), list):
         raise ValueError('Unexpected catalogue response')
-    return data['items']
+    return data['items'], data.get('bindings', [])
+
+
+@app.post('/invoice/bind')
+def invoice_bind():
+    if not v06._authenticated():
+        abort(403)
+    if request.content_length is None or request.content_length > 4096:
+        abort(413)
+    body = request.get_json()
+    if not isinstance(body, dict) or not isinstance(body.get('csrf'), str) or body['csrf'] != v06._csrf():
+        abort(403)
+    fields = ('inn', 'article', 'unit', 'product_id')
+    if any(not isinstance(body.get(key), str) for key in fields):
+        abort(400)
+    payload = {key: body[key] for key in fields}
+    payload['article'] = _catalog_key(payload['article'])
+    payload['unit'] = _catalog_key(payload['unit'])
+    try:
+        result = _catalog_request(payload=payload)
+    except (OSError, ValueError):
+        return jsonify(error='Не удалось сохранить. Проверьте, что карточка существует и единица продажи совпадает.'), 502
+    return jsonify(result)
 
 
 @app.route('/invoice', methods=['GET', 'POST'])
@@ -457,6 +520,7 @@ def invoice_page():
     if not v06._authenticated():
         return redirect(url_for('dashboard_login'))
     parsed = error = catalog_error = None
+    products = []
     if request.method == 'POST':
         if request.content_length is not None and request.content_length > MAX_XML_BYTES + 512_000:
             abort(413)
@@ -474,11 +538,13 @@ def invoice_page():
                 error = str(exc)
     if parsed:
         try:
-            _match_catalog(parsed['rows'], _live_catalog(), parsed['seller_inn'])
+            products, bindings = _catalog_request(parsed['seller_inn'])
+            _match_catalog(parsed['rows'], products, parsed['seller_inn'], bindings)
         except (OSError, ValueError, TypeError, KeyError):
             catalog_error = 'Каталог Эвотора сейчас недоступен. Расчёт УПД готов, сверка карточек не выполнена.'
     return v06._show('УПД и расчёт цен', 'Загрузи XML для предварительной сверки и назначения наценок.', _INVOICE,
-                     csrf=v06._csrf(), parsed=parsed, error=error, catalog_error=catalog_error, rules=CATEGORY_RULES,
+                     csrf=v06._csrf(), parsed=parsed, error=error, catalog_error=catalog_error, products=products, rules=CATEGORY_RULES,
                      rates={k: int(rate) for k, rate in RATES.items()})
+
 
 
